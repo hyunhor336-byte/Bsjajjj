@@ -1,0 +1,383 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore: ['.github/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: "Html To Apk"
+  APP_PKG: "com.htmltoapk.app"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare web files
+        run: |
+          if [ ! -f index.html ]; then
+            first=$(ls *.html 2>/dev/null | head -1 || true)
+            if [ -z "$first" ]; then echo "ارفع ملف index.html اولا"; exit 1; fi
+            cp "$first" index.html
+          fi
+          W=_apk/app/src/main/assets/www
+          mkdir -p "$W"
+          rsync -a --exclude='.git' --exclude='.github' --exclude='_apk' ./ "$W/"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate Android project
+        run: |
+          cd _apk
+          PKG="$APP_PKG"
+          JD="app/src/main/java/$(echo "$PKG" | tr . /)"
+          mkdir -p "$JD" app/src/main/res/xml
+          ICON=""
+          if [ -f ../icon.png ]; then
+            mkdir -p app/src/main/res/mipmap-xxxhdpi
+            cp ../icon.png app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+            ICON='android:icon="@mipmap/ic_launcher"'
+          fi
+
+          cat > gradle.properties <<'EOT'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOT
+
+          cat > settings.gradle <<'EOT'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "app"
+          include ':app'
+          EOT
+
+          cat > build.gradle <<'EOT'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOT
+
+          cat > app/build.gradle <<EOT
+          plugins { id 'com.android.application' }
+          android {
+            namespace '$PKG'
+            compileSdk 34
+            defaultConfig {
+              applicationId '$PKG'
+              minSdk 21
+              targetSdk 34
+              versionCode $GITHUB_RUN_NUMBER
+              versionName '1.$GITHUB_RUN_NUMBER'
+            }
+          }
+          dependencies { implementation 'androidx.core:core:1.13.1' }
+          EOT
+
+          cat > app/src/main/res/xml/file_paths.xml <<'EOT'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+            <cache-path name="out" path="out/"/>
+          </paths>
+          EOT
+
+          cat > app/src/main/AndroidManifest.xml <<EOT
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+            <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+            <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
+            <application android:label="$APP_NAME" $ICON android:usesCleartextTraffic="true" android:hardwareAccelerated="true">
+              <activity android:name=".MainActivity" android:exported="true"
+                android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+                android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <provider android:name="androidx.core.content.FileProvider"
+                android:authorities="$PKG.fileprovider" android:exported="false" android:grantUriPermissions="true">
+                <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths"/>
+              </provider>
+            </application>
+          </manifest>
+          EOT
+
+          cat > "$JD/MainActivity.java" <<'EOT'
+          package __PKG__;
+
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.provider.Settings;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import androidx.core.content.FileProvider;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+          import java.io.RandomAccessFile;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Set;
+
+          public class MainActivity extends Activity {
+            WebView w;
+            ValueCallback<Uri[]> fcb;
+
+            @Override protected void onCreate(Bundle b) {
+              super.onCreate(b);
+              w = new WebView(this);
+              setContentView(w);
+              WebSettings s = w.getSettings();
+              s.setJavaScriptEnabled(true);
+              s.setDomStorageEnabled(true);
+              s.setDatabaseEnabled(true);
+              s.setAllowFileAccess(true);
+              s.setMediaPlaybackRequiresUserGesture(false);
+              w.addJavascriptInterface(new Bridge(), "HtaBridge");
+              w.setWebChromeClient(new WebChromeClient() {
+                @Override public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                  if (fcb != null) fcb.onReceiveValue(null);
+                  fcb = cb;
+                  try { startActivityForResult(p.createIntent(), 77); }
+                  catch (Exception e) { fcb = null; return false; }
+                  return true;
+                }
+              });
+              w.setWebViewClient(new WebViewClient() {
+                @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                  if ("file".equals(r.getUrl().getScheme())) return false;
+                  try { startActivity(new Intent(Intent.ACTION_VIEW, r.getUrl())); } catch (Exception e) { }
+                  return true;
+                }
+              });
+              w.loadUrl("file:///android_asset/www/index.html");
+            }
+
+            @Override protected void onActivityResult(int rq, int rs, Intent d) {
+              if (rq == 77 && fcb != null) {
+                fcb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(rs, d));
+                fcb = null;
+              }
+            }
+
+            @Override public void onBackPressed() {
+              if (w.canGoBack()) w.goBack(); else super.onBackPressed();
+            }
+
+            static String icon(Drawable d, int sz) {
+              Bitmap bm = Bitmap.createBitmap(sz, sz, Bitmap.Config.ARGB_8888);
+              Canvas c = new Canvas(bm);
+              d.setBounds(0, 0, sz, sz);
+              d.draw(c);
+              ByteArrayOutputStream o = new ByteArrayOutputStream();
+              bm.compress(Bitmap.CompressFormat.PNG, 100, o);
+              return Base64.encodeToString(o.toByteArray(), Base64.NO_WRAP);
+            }
+
+            class Bridge {
+              FileOutputStream out;
+              File outFile;
+              String outName;
+
+              String src(String pkg) throws Exception {
+                return getPackageManager().getApplicationInfo(pkg, 0).sourceDir;
+              }
+
+              @JavascriptInterface public String sdk() {
+                return String.valueOf(Build.VERSION.SDK_INT);
+              }
+
+              @JavascriptInterface public String listApps() {
+                try {
+                  final PackageManager pm = getPackageManager();
+                  Intent mi = new Intent(Intent.ACTION_MAIN);
+                  mi.addCategory(Intent.CATEGORY_LAUNCHER);
+                  List<ResolveInfo> rs = pm.queryIntentActivities(mi, 0);
+                  final List<String[]> list = new ArrayList<String[]>();
+                  Set<String> seen = new HashSet<String>();
+                  for (ResolveInfo r : rs) {
+                    String p = r.activityInfo.packageName;
+                    if (p.equals(getPackageName()) || !seen.add(p)) continue;
+                    list.add(new String[]{String.valueOf(r.loadLabel(pm)), p});
+                  }
+                  Collections.sort(list, new Comparator<String[]>() {
+                    public int compare(String[] a, String[] b) { return a[0].compareToIgnoreCase(b[0]); }
+                  });
+                  JSONArray arr = new JSONArray();
+                  for (String[] e : list) {
+                    JSONObject o = new JSONObject();
+                    o.put("n", e[0]);
+                    o.put("p", e[1]);
+                    o.put("i", icon(pm.getApplicationIcon(e[1]), 96));
+                    arr.put(o);
+                  }
+                  return arr.toString();
+                } catch (Exception e) {
+                  return "[]";
+                }
+              }
+
+              @JavascriptInterface public String appInfo(String pkg) {
+                try {
+                  PackageManager pm = getPackageManager();
+                  ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                  PackageInfo pi = pm.getPackageInfo(pkg, 0);
+                  JSONObject o = new JSONObject();
+                  o.put("p", pkg);
+                  o.put("n", String.valueOf(pm.getApplicationLabel(ai)));
+                  o.put("v", pi.versionName == null ? "1.0" : pi.versionName);
+                  o.put("z", new File(ai.sourceDir).length());
+                  o.put("s", ai.splitSourceDirs == null ? 0 : ai.splitSourceDirs.length);
+                  o.put("i", icon(pm.getApplicationIcon(pkg), 192));
+                  return o.toString();
+                } catch (Exception e) {
+                  return "{}";
+                }
+              }
+
+              @JavascriptInterface public String apkSize(String pkg) {
+                try { return String.valueOf(new File(src(pkg)).length()); }
+                catch (Exception e) { return "0"; }
+              }
+
+              @JavascriptInterface public String apkChunk(String pkg, String off) {
+                try {
+                  RandomAccessFile f = new RandomAccessFile(src(pkg), "r");
+                  f.seek(Long.parseLong(off));
+                  byte[] buf = new byte[393216];
+                  int n = f.read(buf);
+                  f.close();
+                  if (n <= 0) return "";
+                  return Base64.encodeToString(buf, 0, n, Base64.NO_WRAP);
+                } catch (Exception e) {
+                  return "";
+                }
+              }
+
+              @JavascriptInterface public String begin(String fn) {
+                try {
+                  outName = new File(fn).getName();
+                  File dir = new File(getCacheDir(), "out");
+                  dir.mkdirs();
+                  outFile = new File(dir, outName);
+                  out = new FileOutputStream(outFile);
+                  return "ok";
+                } catch (Exception e) {
+                  return "error: " + e.getMessage();
+                }
+              }
+
+              @JavascriptInterface public String chunk(String b64) {
+                try {
+                  out.write(Base64.decode(b64, Base64.DEFAULT));
+                  return "ok";
+                } catch (Exception e) {
+                  return "error: " + e.getMessage();
+                }
+              }
+
+              @JavascriptInterface public String finish(boolean install) {
+                try {
+                  out.close();
+                  String where = "Download/" + outName;
+                  try { copyToDownloads(); } catch (Exception e) { where = "(cache)"; }
+                  if (install && outName.toLowerCase().endsWith(".apk")) installApk();
+                  return "ok:" + where;
+                } catch (Exception e) {
+                  return "error: " + e.getMessage();
+                }
+              }
+
+              void copyToDownloads() throws Exception {
+                String lower = outName.toLowerCase();
+                String mime = lower.endsWith(".apk") ? "application/vnd.android.package-archive"
+                    : lower.endsWith(".zip") ? "application/zip" : "application/octet-stream";
+                OutputStream os;
+                if (Build.VERSION.SDK_INT >= 29) {
+                  ContentValues v = new ContentValues();
+                  v.put(MediaStore.Downloads.DISPLAY_NAME, outName);
+                  v.put(MediaStore.Downloads.MIME_TYPE, mime);
+                  Uri u = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                  os = getContentResolver().openOutputStream(u);
+                } else {
+                  File d = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                  d.mkdirs();
+                  os = new FileOutputStream(new File(d, outName));
+                }
+                FileInputStream in = new FileInputStream(outFile);
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                in.close();
+                os.close();
+              }
+
+              void installApk() {
+                if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+                  Intent si = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()));
+                  si.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  startActivity(si);
+                  return;
+                }
+                Uri u = FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".fileprovider", outFile);
+                Intent i = new Intent(Intent.ACTION_VIEW);
+                i.setDataAndType(u, "application/vnd.android.package-archive");
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(i);
+              }
+            }
+          }
+          EOT
+          sed -i "s/__PKG__/$PKG/" "$JD/MainActivity.java"
+
+      - name: Build APK
+        working-directory: _apk
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FN="$(echo "$APP_NAME" | tr ' ' '_').apk"
+          cp _apk/app/build/outputs/apk/debug/app-debug.apk "$FN"
+          gh release create "build-${{ github.run_number }}" "$FN" \
+            --title "$APP_NAME #${{ github.run_number }}" \
+            --notes "APK جاهز للتثبيت"
